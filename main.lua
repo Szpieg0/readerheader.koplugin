@@ -497,13 +497,21 @@ local function appendHeaderMenu(menu_items, plugin)
     local sub_items = menu_items.status_bar.sub_item_table or {}
     menu_items.status_bar.sub_item_table = sub_items
 
-    for _, item in ipairs(sub_items) do
+    for index, item in ipairs(sub_items) do
         if item.reader_header_settings then
-            return
+            table.remove(sub_items, index)
+            break
         end
     end
 
-    table.insert(sub_items, plugin:getHeaderMenuTable())
+    local insert_index = #sub_items + 1
+    for index, item in ipairs(sub_items) do
+        if item.text == _("Alt status bar") then
+            insert_index = index + 1
+            break
+        end
+    end
+    table.insert(sub_items, insert_index, plugin:getHeaderMenuTable())
 end
 
 local function installStatusBarMenuPatch(plugin)
