@@ -1,9 +1,9 @@
 local BD = require("ui/bidi")
 local Blitbuffer = require("ffi/blitbuffer")
-local ButtonDialog = require("ui/widget/buttondialog")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local ConfirmBox = require("ui/widget/confirmbox")
 local Device = require("device")
+local Event = require("ui/event")
 local Font = require("ui/font")
 local Geom = require("ui/geometry")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
@@ -38,6 +38,7 @@ local templateToTokenSet
 local getTemplateTokens
 local tokenSetToTemplate
 local faceKeyForToken
+local getSlotSegments
 local ReaderHeader = WidgetContainer:extend{
     name = "readerheader",
     is_doc_only = true,
@@ -53,6 +54,7 @@ local DEFAULT_SETTINGS = {
     font_size = nil,
     font_bold = nil,
     top_padding = "small",
+    book_text_padding = "none",
     use_book_margins = true,
     margin = "large",
     max_width_pct = 100,
@@ -63,6 +65,8 @@ local original_paintTo = ReaderView.paintTo
 local patch_installed = false
 local menu_patch_installed = false
 local header_paint_error_logged = false
+local refreshReader
+local applyHeaderMargin
 
 local TEMPLATE_TOKENS = {
     { key = "title", text = _("Title") },
@@ -93,6 +97,18 @@ local SEPARATORS = {
 local FONT_SIZES = { 8, 10, 12, 14, 16, 18, 20, 22, 24, 28, 32 }
 local WIFI_ICON = "\u{ECA8}"
 local WIFI_OFF_ICON = "\u{ECA9}"
+
+local LAYOUT_KEYS = {
+    enabled = true,
+    center_template = true,
+    left_template = true,
+    right_template = true,
+    font_face = true,
+    font_size = true,
+    font_bold = true,
+    top_padding = true,
+    book_text_padding = true,
+}
 
 local function copyDefaults()
     local settings = {}
@@ -156,6 +172,13 @@ local function getPadding(name)
         return Size.padding.large
     end
     return Size.padding.small
+end
+
+local function getBookTextPadding(name)
+    if name == "large" then
+        return Screen:scaleBySize(24)
+    end
+    return 0
 end
 
 local function getMargin(name)
@@ -287,6 +310,58 @@ local function measureText(text, face, bold)
     return width
 end
 
+local function hasHeaderContent(settings)
+    return tostring(settings.left_template or "") ~= ""
+        or tostring(settings.center_template or "") ~= ""
+        or tostring(settings.right_template or "") ~= ""
+end
+
+local function getSegmentHeight(segment, face, font_size)
+    local segment_face = segment.face_key and Font:getFace(segment.face_key, font_size) or face
+    local text_widget = TextWidget:new{
+        text = (segment.text ~= "" and segment.text or "Hg"):gsub(" ", "\u{00A0}"),
+        face = segment_face,
+        bold = segment.bold,
+        padding = 0,
+    }
+    local height = text_widget:getSize().h
+    text_widget:free()
+    return height
+end
+
+local function getHeaderReservedHeight(settings, view, base_top_margin)
+    if not settings.enabled or not hasHeaderContent(settings) then
+        return 0
+    end
+    local footer_settings = getFooterSettings()
+    local font_size = settings.font_size or footer_settings.text_font_size or 14
+    local face = Font:getFace(settings.font_face or "ffont", font_size)
+    local default_bold = getDefaultBold(settings)
+    local height = getSegmentHeight({ text = "Hg", bold = default_bold }, face, font_size)
+    if view then
+        local ok, values = pcall(collectValues, view, settings)
+        if ok then
+            for _, slot in ipairs({ "left", "center", "right" }) do
+                for _, segment in ipairs(getSlotSegments(settings[templateKeyForSlot(slot)], values, settings, slot, default_bold)) do
+                    height = math.max(height, getSegmentHeight(segment, face, font_size))
+                end
+            end
+        end
+    end
+    local top_padding = getPadding(settings.top_padding)
+    if settings.book_text_padding == "none" then
+        return math.max(0, height + top_padding - (base_top_margin or 0))
+    end
+    return height + top_padding + getBookTextPadding(settings.book_text_padding)
+end
+
+local function getActiveHeaderReservedHeight(view, base_top_margin)
+    if not view or view.render_mode ~= nil then
+        return 0
+    end
+    return getHeaderReservedHeight(getEffectiveSettings(), view, base_top_margin)
+end
+
 local function getSlotBoldSet(settings, slot)
     local template = settings[boldKeyForSlot(slot)]
     if template == nil then
@@ -303,7 +378,7 @@ local function isSlotTokenBold(settings, slot, token_key, default_bold)
     return bold_set[token_key] == true
 end
 
-local function getSlotSegments(template, values, settings, slot, default_bold)
+getSlotSegments = function(template, values, settings, slot, default_bold)
     local segments = {}
     for _, key in ipairs(getTemplateTokens(template)) do
         local text = values[key] or ""
@@ -580,7 +655,50 @@ local function installStatusBarMenuPatch(plugin)
     menu_patch_installed = true
 end
 
-local function refreshReader()
+applyHeaderMargin = function(ui, margins)
+    if not ui or not ui.view or not ui.document or not ui.typeset then
+        return false
+    end
+    local base_top_margin = Screen:scaleBySize(margins[2])
+    local ok_height, header_height = pcall(getActiveHeaderReservedHeight, ui.view, base_top_margin)
+    if not ok_height then
+        logger.warn("ReaderHeader: failed to calculate header margin:", header_height)
+        return false
+    end
+    if header_height <= 0 then
+        return false
+    end
+
+    local left = Screen:scaleBySize(margins[1])
+    local top = Screen:scaleBySize(margins[2]) + header_height
+    local right = Screen:scaleBySize(margins[3])
+    local bottom
+    if ui.view.footer.reclaim_height then
+        bottom = Screen:scaleBySize(margins[4])
+    else
+        bottom = Screen:scaleBySize(margins[4]) + ui.view.footer:getHeight()
+    end
+    ui.document:setPageMargins(left, top, right, bottom)
+    return true
+end
+
+local function refreshReaderLayout(ui, update_margins)
+    if not ui then
+        refreshReader()
+        return
+    end
+    if update_margins and ui.typeset and ui.typeset.unscaled_margins then
+        if applyHeaderMargin(ui, ui.typeset.unscaled_margins) then
+            ui:handleEvent(Event:new("UpdatePos"))
+        else
+            ui:handleEvent(Event:new("SetPageMargins", ui.typeset.unscaled_margins))
+        end
+    else
+        refreshReader()
+    end
+end
+
+refreshReader = function()
     UIManager:setDirty(nil, "ui")
 end
 
@@ -647,30 +765,10 @@ local function updateTokenItemText(item)
     item.text = item.text .. " ▶"
 end
 
-local function showBoldDialog(item, refresh_callback)
-    local dialog
-    local bold_text = item.bold_set[item.key] and _("Regular") or _("Bold")
-    dialog = ButtonDialog:new{
-        title = item.label,
-        buttons = {
-            {{
-                text = bold_text,
-                callback = function()
-                    item.bold_set[item.key] = not item.bold_set[item.key]
-                    updateTokenItemText(item)
-                    if refresh_callback then refresh_callback() end
-                    UIManager:close(dialog)
-                end,
-            }},
-            {{
-                text = _("Close"),
-                callback = function()
-                    UIManager:close(dialog)
-                end,
-            }},
-        },
-    }
-    UIManager:show(dialog)
+local function toggleBoldItem(item, refresh_callback)
+    item.bold_set[item.key] = not item.bold_set[item.key]
+    updateTokenItemText(item)
+    if refresh_callback then refresh_callback() end
 end
 
 local function newTokenItem(token, checked, bold_set)
@@ -690,7 +788,7 @@ local function newTokenItem(token, checked, bold_set)
         item.dim = not item.checked
     end
     entry.hold_callback = function(item, refresh_callback)
-        showBoldDialog(item, refresh_callback)
+        toggleBoldItem(item, refresh_callback)
     end
     return entry
 end
@@ -810,6 +908,7 @@ function ReaderHeader:configureSlotItems(title, slot, touchmenu_instance)
             local template = tokenItemsToTemplate(item_table)
             saveSetting(key, template)
             saveSetting(bold_key, tokenSetToTemplate(bold_set, template))
+            refreshReaderLayout(self.ui, true)
             if touchmenu_instance then touchmenu_instance:updateItems() end
         end,
     }
@@ -823,7 +922,7 @@ function ReaderHeader:resetSettings()
         ok_text = _("Reset"),
         ok_callback = function()
             G_reader_settings:saveSetting("reader_header", copyDefaults())
-            refreshReader()
+            refreshReaderLayout(self.ui, true)
         end,
     }
     UIManager:show(confirm_box)
@@ -831,8 +930,33 @@ end
 
 function ReaderHeader:saveAndRefresh(key, value, touchmenu_instance)
     saveSetting(key, value)
-    refreshReader()
+    refreshReaderLayout(self.ui, LAYOUT_KEYS[key] == true)
     if touchmenu_instance then touchmenu_instance:updateItems() end
+end
+
+function ReaderHeader:onPreRenderDocument()
+    if self.ui and self.ui.typeset and self.ui.typeset.unscaled_margins then
+        applyHeaderMargin(self.ui, self.ui.typeset.unscaled_margins)
+    end
+end
+
+function ReaderHeader:onSetPageMargins(margins)
+    if self._applying_header_margin then
+        return
+    end
+    if not self.ui or not self.ui.document or not self.ui.typeset or not self.ui.typeset.unscaled_margins then
+        return
+    end
+    if margins ~= self.ui.typeset.unscaled_margins then
+        return
+    end
+
+    self._applying_header_margin = true
+    local ok_margin, err = pcall(applyHeaderMargin, self.ui, margins)
+    self._applying_header_margin = false
+    if not ok_margin then
+        logger.warn("ReaderHeader: failed to apply header margin:", err)
+    end
 end
 
 function ReaderHeader:getHeaderMenuTable()
@@ -914,6 +1038,15 @@ function ReaderHeader:getHeaderMenuTable()
                     { text = _("Small"), checked_func = function() return getSettings().top_padding == "small" end, callback = function(touchmenu_instance) self:saveAndRefresh("top_padding", "small", touchmenu_instance) end },
                     { text = _("Default"), checked_func = function() return getSettings().top_padding == "default" end, callback = function(touchmenu_instance) self:saveAndRefresh("top_padding", "default", touchmenu_instance) end },
                     { text = _("Large"), checked_func = function() return getSettings().top_padding == "large" end, callback = function(touchmenu_instance) self:saveAndRefresh("top_padding", "large", touchmenu_instance) end },
+                },
+            },
+            {
+                text = _("Book text padding"),
+                help_text = _("Extra space between the header and the book text."),
+                sub_item_table = {
+                    { text = _("None"), checked_func = function() return getSettings().book_text_padding == "none" end, callback = function(touchmenu_instance) self:saveAndRefresh("book_text_padding", "none", touchmenu_instance) end },
+                    { text = _("Default"), checked_func = function() return getSettings().book_text_padding == "default" end, callback = function(touchmenu_instance) self:saveAndRefresh("book_text_padding", "default", touchmenu_instance) end },
+                    { text = _("Large"), checked_func = function() return getSettings().book_text_padding == "large" end, callback = function(touchmenu_instance) self:saveAndRefresh("book_text_padding", "large", touchmenu_instance) end },
                 },
             },
             {
