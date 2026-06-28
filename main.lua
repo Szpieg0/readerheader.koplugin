@@ -19,6 +19,7 @@ local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local datetime = require("datetime")
+local logger = require("logger")
 local util = require("util")
 local _ = require("gettext")
 local T = require("ffi/util").template
@@ -54,7 +55,7 @@ local DEFAULT_SETTINGS = {
 local original_paintTo = ReaderView.paintTo
 local patch_installed = false
 local menu_patch_installed = false
-local preview_settings = nil
+local header_paint_error_logged = false
 
 local TEMPLATE_TOKENS = {
     { key = "title", text = _("Title") },
@@ -116,20 +117,7 @@ local function getSettings()
 end
 
 local function getEffectiveSettings()
-    return preview_settings or getSettings()
-end
-
-local function startPreviewSettings(settings)
-    preview_settings = {}
-    settings = settings or getSettings()
-    for key, value in pairs(settings) do
-        preview_settings[key] = value
-    end
-    return preview_settings
-end
-
-local function stopPreviewSettings()
-    preview_settings = nil
+    return getSettings()
 end
 
 local function saveSetting(key, value)
@@ -231,7 +219,7 @@ local function collectValues(view, settings)
 end
 
 local function fitText(text, face, bold, max_width)
-    if text == nil or text == "" then
+    if text == nil or text == "" or max_width <= 0 then
         return ""
     end
     local text_widget = TextWidget:new{
@@ -319,6 +307,9 @@ local function copySegments(segments)
 end
 
 local function fitSegments(segments, face, max_width)
+    if max_width <= 0 then
+        return {}
+    end
     local fitted = copySegments(segments)
     local width = measureSegments(fitted, face)
     local loops = 0
@@ -335,8 +326,13 @@ local function fitSegments(segments, face, max_width)
         if not widest_index then break end
         local segment = fitted[widest_index]
         local target_width = math.max(0, segment.width - (width - max_width) - measureText("...", face, segment.bold))
-        segment.text = fitText(segment.text, face, segment.bold, target_width)
-        segment.width = measureText(segment.text, face, segment.bold)
+        if target_width <= 0 then
+            segment.text = ""
+            segment.width = 0
+        else
+            segment.text = fitText(segment.text, face, segment.bold, target_width)
+            segment.width = measureText(segment.text, face, segment.bold)
+        end
         width = measureSegments(fitted, face)
     end
     while width > max_width do
@@ -365,7 +361,9 @@ local function getContentWidth(view, settings)
         left_margin = margins.left or fallback_margin
         right_margin = margins.right or fallback_margin
     end
-    return Screen:getWidth() - left_margin - right_margin, left_margin, right_margin
+    local screen_width = Screen:getWidth()
+    local content_width = math.max(0, screen_width - left_margin - right_margin)
+    return content_width, left_margin, right_margin
 end
 
 local function newHeaderTextWidget(text, face, bold, fgcolor)
@@ -393,6 +391,9 @@ end
 
 local function paintSlotHeader(view, bb, x, y, settings, face, default_bold, fgcolor, top_padding, values)
     local avail_width, left_margin, right_margin = getContentWidth(view, settings)
+    if avail_width <= 0 then
+        return
+    end
     local left_segments = getSlotSegments(settings.left_template, values, settings, "left", default_bold)
     local center_segments = getSlotSegments(settings.center_template, values, settings, "center", default_bold)
     local right_segments = getSlotSegments(settings.right_template, values, settings, "right", default_bold)
@@ -426,6 +427,9 @@ local function paintSlotHeader(view, bb, x, y, settings, face, default_bold, fgc
     local left_widget = has_left and left_max_width > 0 and newHeaderSlotWidget(left_segments, face, fgcolor, left_max_width) or nil
     local center_widget = has_center and center_max_width > 0 and newHeaderSlotWidget(center_segments, face, fgcolor, center_max_width) or nil
     local right_widget = has_right and right_max_width > 0 and newHeaderSlotWidget(right_segments, face, fgcolor, right_max_width) or nil
+    if not left_widget and not center_widget and not right_widget then
+        return
+    end
     local height = top_padding
 
     if left_widget then height = math.max(height, left_widget:getSize().h + top_padding) end
@@ -481,7 +485,13 @@ local function installPaintPatch()
     if patch_installed then return end
     ReaderView.paintTo = function(self, bb, x, y)
         original_paintTo(self, bb, x, y)
-        paintHeader(self, bb, x, y)
+        local ok, err = pcall(paintHeader, self, bb, x, y)
+        if ok then
+            header_paint_error_logged = false
+        elseif not header_paint_error_logged then
+            header_paint_error_logged = true
+            logger.warn("ReaderHeader: failed to paint header:", err)
+        end
     end
     patch_installed = true
 end
@@ -602,7 +612,6 @@ local function showBoldDialog(item, refresh_callback)
                 callback = function()
                     item.bold_set[item.key] = not item.bold_set[item.key]
                     updateTokenItemText(item)
-                    if item.preview_callback then item.preview_callback() end
                     if refresh_callback then refresh_callback() end
                     UIManager:close(dialog)
                 end,
@@ -633,7 +642,6 @@ local function newTokenItem(token, checked, bold_set)
     entry.callback = function(item)
         item.checked = not item.checked
         item.dim = not item.checked
-        if item.preview_callback then item.preview_callback() end
     end
     entry.hold_callback = function(item, refresh_callback)
         showBoldDialog(item, refresh_callback)
@@ -747,15 +755,6 @@ function ReaderHeader:configureSlotItems(title, slot, touchmenu_instance)
     local settings = getSettings()
     local bold_set = getInitialSlotBoldSet(settings, slot)
     local item_table = templateToTokenItems(settings[key], bold_set)
-    local preview = startPreviewSettings(settings)
-    local preview_callback = function()
-        preview[key] = tokenItemsToTemplate(item_table)
-        preview[bold_key] = tokenSetToTemplate(bold_set, preview[key])
-        refreshReader()
-    end
-    for _, item in ipairs(item_table) do
-        item.preview_callback = preview_callback
-    end
     local SortWidget = require("ui/widget/sortwidget")
     local sort_widget
     sort_widget = SortWidget:new{
@@ -763,32 +762,11 @@ function ReaderHeader:configureSlotItems(title, slot, touchmenu_instance)
         item_table = item_table,
         callback = function()
             local template = tokenItemsToTemplate(item_table)
-            preview[key] = template
-            preview[bold_key] = tokenSetToTemplate(bold_set, template)
             saveSetting(key, template)
-            saveSetting(bold_key, preview[bold_key])
-            refreshReader()
+            saveSetting(bold_key, tokenSetToTemplate(bold_set, template))
             if touchmenu_instance then touchmenu_instance:updateItems() end
         end,
     }
-    local original_moveItem = sort_widget.moveItem
-    sort_widget.moveItem = function(widget, diff)
-        local result = original_moveItem(widget, diff)
-        preview_callback()
-        return result
-    end
-    local original_onCancel = sort_widget.onCancel
-    sort_widget.onCancel = function(widget)
-        local result = original_onCancel(widget)
-        preview_callback()
-        return result
-    end
-    local original_onClose = sort_widget.onClose
-    sort_widget.onClose = function(widget)
-        stopPreviewSettings()
-        refreshReader()
-        return original_onClose(widget)
-    end
     UIManager:show(sort_widget)
 end
 
