@@ -7,9 +7,10 @@ local Font = require("ui/font")
 local Geom = require("ui/geometry")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
-local InfoMessage = require("ui/widget/infomessage")
-local InputDialog = require("ui/widget/inputdialog")
+local LeftContainer = require("ui/widget/container/leftcontainer")
+local OverlapGroup = require("ui/widget/overlapgroup")
 local ReaderView = require("apps/reader/modules/readerview")
+local RightContainer = require("ui/widget/container/rightcontainer")
 local Size = require("ui/size")
 local TextWidget = require("ui/widget/textwidget")
 local UIManager = require("ui/uimanager")
@@ -22,6 +23,13 @@ local _ = require("gettext")
 local T = require("ffi/util").template
 
 local Screen = Device.screen
+local unpack = unpack or table.unpack
+local templateKeyForSlot
+local tokenString
+local boldKeyForSlot
+local templateToTokenSet
+local getTemplateTokens
+local tokenSetToTemplate
 local ReaderHeader = WidgetContainer:extend{
     name = "readerheader",
     is_doc_only = true,
@@ -29,10 +37,9 @@ local ReaderHeader = WidgetContainer:extend{
 
 local DEFAULT_SETTINGS = {
     enabled = true,
-    layout = "centered",
-    center_template = "{author} {separator} {title}",
-    left_template = "{author}",
-    right_template = "{title}",
+    center_template = "{time}",
+    left_template = "{title}",
+    right_template = "{battery}",
     separator = "-",
     font_face = "ffont",
     font_size = nil,
@@ -41,13 +48,39 @@ local DEFAULT_SETTINGS = {
     use_book_margins = true,
     margin = "large",
     max_width_pct = 100,
-    left_max_width_pct = 48,
-    right_max_width_pct = 48,
 }
 
 local original_paintTo = ReaderView.paintTo
 local patch_installed = false
 local menu_patch_installed = false
+local preview_settings = nil
+
+local TEMPLATE_TOKENS = {
+    { key = "title", text = _("Title") },
+    { key = "author", text = _("Author") },
+    { key = "chapter", text = _("Chapter") },
+    { key = "page", text = _("Page") },
+    { key = "pages", text = _("Pages") },
+    { key = "page_progress", text = _("Page progress") },
+    { key = "percentage", text = _("Percentage") },
+    { key = "chapter_progress", text = _("Chapter progress") },
+    { key = "pages_left", text = _("Pages left in chapter") },
+    { key = "pages_left_book", text = _("Pages left in book") },
+    { key = "time", text = _("Time") },
+    { key = "battery", text = _("Battery") },
+    { key = "separator", text = _("Separator") },
+}
+
+local SEPARATORS = {
+    { text = _("None"), value = "" },
+    { text = "-", value = "-" },
+    { text = "|", value = "|" },
+    { text = "·", value = "·" },
+    { text = "•", value = "•" },
+    { text = "/", value = "/" },
+}
+
+local FONT_SIZES = { 8, 10, 12, 14, 16, 18, 20, 22, 24, 28, 32 }
 
 local function copyDefaults()
     local settings = {}
@@ -64,7 +97,38 @@ local function getSettings()
             settings[key] = value
         end
     end
+    if not settings.slots_migrated then
+        if settings.layout == "cornered" then
+            settings.center_template = ""
+            settings.left_template = settings.left_template ~= "" and settings.left_template or "{author}"
+            settings.right_template = settings.right_template ~= "" and settings.right_template or "{title}"
+        elseif settings.layout == "centered" then
+            settings.center_template = settings.center_template ~= "" and settings.center_template or DEFAULT_SETTINGS.center_template
+            settings.left_template = ""
+            settings.right_template = ""
+        end
+        settings.layout = nil
+        settings.slots_migrated = true
+        G_reader_settings:saveSetting("reader_header", settings)
+    end
     return settings
+end
+
+local function getEffectiveSettings()
+    return preview_settings or getSettings()
+end
+
+local function startPreviewSettings(settings)
+    preview_settings = {}
+    settings = settings or getSettings()
+    for key, value in pairs(settings) do
+        preview_settings[key] = value
+    end
+    return preview_settings
+end
+
+local function stopPreviewSettings()
+    preview_settings = nil
 end
 
 local function saveSetting(key, value)
@@ -75,6 +139,13 @@ end
 
 local function getFooterSettings()
     return G_reader_settings:readSetting("footer") or {}
+end
+
+local function getDefaultBold(settings)
+    if settings.font_bold == nil then
+        return getFooterSettings().text_font_bold or false
+    end
+    return settings.font_bold
 end
 
 local function getPadding(name)
@@ -158,13 +229,6 @@ local function collectValues(view, settings)
     }
 end
 
-local function expandTemplate(template, values)
-    template = template or ""
-    return (template:gsub("{([%w_]+)}", function(key)
-        return values[key] or ""
-    end):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", ""))
-end
-
 local function fitText(text, face, bold, max_width)
     if text == nil or text == "" then
         return ""
@@ -184,6 +248,113 @@ local function fitText(text, face, bold, max_width)
     return BD.auto(fitted_text)
 end
 
+local function measureText(text, face, bold)
+    if text == nil or text == "" then
+        return 0
+    end
+    local text_widget = TextWidget:new{
+        text = text:gsub(" ", "\u{00A0}"),
+        face = face,
+        bold = bold,
+        padding = 0,
+    }
+    local width = text_widget:getSize().w
+    text_widget:free()
+    return width
+end
+
+local function getSlotBoldSet(settings, slot)
+    local template = settings[boldKeyForSlot(slot)]
+    if template == nil then
+        return nil
+    end
+    return templateToTokenSet(template)
+end
+
+local function isSlotTokenBold(settings, slot, token_key, default_bold)
+    local bold_set = getSlotBoldSet(settings, slot)
+    if bold_set == nil then
+        return default_bold
+    end
+    return bold_set[token_key] == true
+end
+
+local function getSlotSegments(template, values, settings, slot, default_bold)
+    local segments = {}
+    for _, key in ipairs(getTemplateTokens(template)) do
+        local text = values[key] or ""
+        if text ~= "" then
+            if #segments > 0 then
+                table.insert(segments, { text = " ", bold = default_bold })
+            end
+            table.insert(segments, {
+                text = text,
+                bold = isSlotTokenBold(settings, slot, key, default_bold),
+            })
+        end
+    end
+    return segments
+end
+
+local function measureSegments(segments, face)
+    local width = 0
+    for _, segment in ipairs(segments) do
+        segment.width = measureText(segment.text, face, segment.bold)
+        width = width + segment.width
+    end
+    return width
+end
+
+local function copySegments(segments)
+    local copied = {}
+    for _, segment in ipairs(segments) do
+        table.insert(copied, {
+            text = segment.text,
+            bold = segment.bold,
+            width = segment.width,
+        })
+    end
+    return copied
+end
+
+local function fitSegments(segments, face, max_width)
+    local fitted = copySegments(segments)
+    local width = measureSegments(fitted, face)
+    local loops = 0
+    while width > max_width and loops < (#fitted * 3) do
+        loops = loops + 1
+        local widest_index
+        local widest_width = 0
+        for index, segment in ipairs(fitted) do
+            if segment.text ~= " " and segment.width > widest_width then
+                widest_index = index
+                widest_width = segment.width
+            end
+        end
+        if not widest_index then break end
+        local segment = fitted[widest_index]
+        local target_width = math.max(0, segment.width - (width - max_width) - measureText("...", face, segment.bold))
+        segment.text = fitText(segment.text, face, segment.bold, target_width)
+        segment.width = measureText(segment.text, face, segment.bold)
+        width = measureSegments(fitted, face)
+    end
+    while width > max_width do
+        local widest_index
+        local widest_width = 0
+        for index, segment in ipairs(fitted) do
+            if segment.width > widest_width then
+                widest_index = index
+                widest_width = segment.width
+            end
+        end
+        if not widest_index then break end
+        fitted[widest_index].text = ""
+        fitted[widest_index].width = 0
+        width = measureSegments(fitted, face)
+    end
+    return fitted
+end
+
 local function getContentWidth(view, settings)
     local fallback_margin = getMargin(settings.margin)
     local left_margin = fallback_margin
@@ -196,58 +367,90 @@ local function getContentWidth(view, settings)
     return Screen:getWidth() - left_margin - right_margin, left_margin, right_margin
 end
 
-local function paintCenteredHeader(view, bb, x, y, settings, face, bold, fgcolor, top_padding, values)
-    local avail_width, left_margin, right_margin = getContentWidth(view, settings)
-    local max_width = avail_width * settings.max_width_pct / 100
-    local header_text = TextWidget:new{
-        text = fitText(expandTemplate(settings.center_template, values), face, bold, max_width),
+local function newHeaderTextWidget(text, face, bold, fgcolor)
+    return TextWidget:new{
+        text = text:gsub(" ", "\u{00A0}"),
         face = face,
         bold = bold,
         fgcolor = fgcolor,
         padding = 0,
     }
+end
+
+local function newHeaderSlotWidget(segments, face, fgcolor, max_width)
+    local widgets = {}
+    for _, segment in ipairs(fitSegments(segments, face, max_width)) do
+        if segment.text ~= "" then
+            table.insert(widgets, newHeaderTextWidget(segment.text, face, segment.bold, fgcolor))
+        end
+    end
+    if #widgets == 0 then
+        return nil
+    end
+    return HorizontalGroup:new(widgets)
+end
+
+local function paintSlotHeader(view, bb, x, y, settings, face, default_bold, fgcolor, top_padding, values)
+    local avail_width, left_margin, right_margin = getContentWidth(view, settings)
+    local left_segments = getSlotSegments(settings.left_template, values, settings, "left", default_bold)
+    local center_segments = getSlotSegments(settings.center_template, values, settings, "center", default_bold)
+    local right_segments = getSlotSegments(settings.right_template, values, settings, "right", default_bold)
+    local left_width = measureSegments(left_segments, face)
+    local center_width = measureSegments(center_segments, face)
+    local right_width = measureSegments(right_segments, face)
+    local has_left = left_width > 0
+    local has_center = center_width > 0
+    local has_right = right_width > 0
+
+    if not has_left and not has_center and not has_right then
+        return
+    end
+
+    local left_max_width = left_width
+    local right_max_width = right_width
+    local center_max_width = math.min(center_width, avail_width * settings.max_width_pct / 100)
+
+    if has_center then
+        local center_x = math.floor((avail_width - center_max_width) / 2)
+        left_max_width = math.min(left_width, math.max(0, center_x))
+        right_max_width = math.min(right_width, math.max(0, avail_width - center_x - center_max_width))
+    elseif has_left or has_right then
+        if left_width + right_width > avail_width then
+            local half_width = math.floor(avail_width / 2)
+            left_max_width = math.min(left_width, math.max(0, avail_width - math.min(right_width, half_width)))
+            right_max_width = math.min(right_width, math.max(0, avail_width - left_max_width))
+        end
+    end
+
+    local left_widget = has_left and left_max_width > 0 and newHeaderSlotWidget(left_segments, face, fgcolor, left_max_width) or nil
+    local center_widget = has_center and center_max_width > 0 and newHeaderSlotWidget(center_segments, face, fgcolor, center_max_width) or nil
+    local right_widget = has_right and right_max_width > 0 and newHeaderSlotWidget(right_segments, face, fgcolor, right_max_width) or nil
+    local height = top_padding
+
+    if left_widget then height = math.max(height, left_widget:getSize().h + top_padding) end
+    if center_widget then height = math.max(height, center_widget:getSize().h + top_padding) end
+    if right_widget then height = math.max(height, right_widget:getSize().h + top_padding) end
+
+    local content_dimen = Geom:new{ w = avail_width, h = height - top_padding }
+    local layers = {}
+    if left_widget then
+        table.insert(layers, LeftContainer:new{ dimen = content_dimen, left_widget })
+    end
+    if center_widget then
+        table.insert(layers, CenterContainer:new{ dimen = content_dimen, center_widget })
+    end
+    if right_widget then
+        table.insert(layers, RightContainer:new{ dimen = content_dimen, right_widget })
+    end
+
     local header = CenterContainer:new{
-        dimen = Geom:new{ w = Screen:getWidth(), h = header_text:getSize().h + top_padding },
+        dimen = Geom:new{ w = Screen:getWidth(), h = height },
         VerticalGroup:new{
             VerticalSpan:new{ width = top_padding },
             HorizontalGroup:new{
                 HorizontalSpan:new{ width = left_margin },
-                header_text,
+                OverlapGroup:new{ dimen = content_dimen, unpack(layers) },
                 HorizontalSpan:new{ width = right_margin },
-            },
-        },
-    }
-    header:paintTo(bb, x, y)
-end
-
-local function paintCorneredHeader(view, bb, x, y, settings, face, bold, fgcolor, top_padding, values)
-    local avail_width = getContentWidth(view, settings)
-    local left_header_text = TextWidget:new{
-        text = fitText(expandTemplate(settings.left_template, values), face, bold, avail_width * settings.left_max_width_pct / 100),
-        face = face,
-        bold = bold,
-        fgcolor = fgcolor,
-        padding = 0,
-    }
-    local right_header_text = TextWidget:new{
-        text = fitText(expandTemplate(settings.right_template, values), face, bold, avail_width * settings.right_max_width_pct / 100),
-        face = face,
-        bold = bold,
-        fgcolor = fgcolor,
-        padding = 0,
-    }
-    local dynamic_space = avail_width - left_header_text:getSize().w - right_header_text:getSize().w
-    if dynamic_space < 0 then
-        dynamic_space = 0
-    end
-    local header = CenterContainer:new{
-        dimen = Geom:new{ w = Screen:getWidth(), h = math.max(left_header_text:getSize().h, right_header_text:getSize().h) + top_padding },
-        VerticalGroup:new{
-            VerticalSpan:new{ width = top_padding },
-            HorizontalGroup:new{
-                left_header_text,
-                HorizontalSpan:new{ width = dynamic_space },
-                right_header_text,
             },
         },
     }
@@ -258,26 +461,19 @@ local function paintHeader(view, bb, x, y)
     if view.render_mode ~= nil then return end
     if bb ~= Screen.bb then return end
 
-    local settings = getSettings()
+    local settings = getEffectiveSettings()
     if not settings.enabled then return end
 
     local footer_settings = getFooterSettings()
     local font_size = settings.font_size or footer_settings.text_font_size or 14
-    local bold = settings.font_bold
-    if bold == nil then
-        bold = footer_settings.text_font_bold or false
-    end
+    local bold = getDefaultBold(settings)
 
     local face = Font:getFace(settings.font_face or "ffont", font_size)
     local fgcolor = Blitbuffer.COLOR_BLACK
     local top_padding = getPadding(settings.top_padding)
     local values = collectValues(view, settings)
 
-    if settings.layout == "cornered" then
-        paintCorneredHeader(view, bb, x, y, settings, face, bold, fgcolor, top_padding, values)
-    else
-        paintCenteredHeader(view, bb, x, y, settings, face, bold, fgcolor, top_padding, values)
-    end
+    paintSlotHeader(view, bb, x, y, settings, face, bold, fgcolor, top_padding, values)
 end
 
 local function installPaintPatch()
@@ -329,6 +525,194 @@ local function refreshReader()
     UIManager:setDirty(nil, "ui")
 end
 
+templateKeyForSlot = function(slot)
+    return slot .. "_template"
+end
+
+tokenString = function(token_key)
+    return "{" .. token_key .. "}"
+end
+
+boldKeyForSlot = function(slot)
+    return slot .. "_bold_template"
+end
+
+templateToTokenSet = function(template)
+    local set = {}
+    for key in tostring(template or ""):gmatch("{([%w_]+)}") do
+        set[key] = true
+    end
+    return set
+end
+
+getTemplateTokens = function(template)
+    local used = {}
+    local tokens = {}
+    for key in tostring(template or ""):gmatch("{([%w_]+)}") do
+        if not used[key] then
+            table.insert(tokens, key)
+            used[key] = true
+        end
+    end
+    return tokens
+end
+
+tokenSetToTemplate = function(set, order_template)
+    local parts = {}
+    local added = {}
+    for _, key in ipairs(getTemplateTokens(order_template)) do
+        if set[key] then
+            table.insert(parts, tokenString(key))
+            added[key] = true
+        end
+    end
+    for _, token in ipairs(TEMPLATE_TOKENS) do
+        if set[token.key] and not added[token.key] then
+            table.insert(parts, tokenString(token.key))
+        end
+    end
+    return table.concat(parts, " ")
+end
+
+local function templateToTokenItems(template)
+    local used = {}
+    local items = {}
+    local known = {}
+
+    for _, token in ipairs(TEMPLATE_TOKENS) do
+        known[token.key] = token
+    end
+
+    for key in tostring(template or ""):gmatch("{([%w_]+)}") do
+        if known[key] and not used[key] then
+            local entry = {}
+            entry.text = known[key].text
+            entry.key = key
+            entry.checked = true
+            entry.checked_func = function()
+                return entry.checked
+            end
+            entry.callback = function(item)
+                item.checked = not item.checked
+                item.dim = not item.checked
+                if item.preview_callback then item.preview_callback() end
+            end
+            table.insert(items, entry)
+            used[key] = true
+        end
+    end
+
+    local selected = templateToTokenSet(template)
+    for _, token in ipairs(TEMPLATE_TOKENS) do
+        if not used[token.key] then
+            local entry = {}
+            entry.text = token.text
+            entry.key = token.key
+            entry.checked = selected[token.key] == true
+            entry.dim = selected[token.key] ~= true
+            entry.checked_func = function()
+                return entry.checked
+            end
+            entry.callback = function(item)
+                item.checked = not item.checked
+                item.dim = not item.checked
+                if item.preview_callback then item.preview_callback() end
+            end
+            table.insert(items, entry)
+        end
+    end
+
+    return items
+end
+
+local function tokenItemsToTemplate(items)
+    local parts = {}
+    for _, item in ipairs(items) do
+        if item.checked then
+            table.insert(parts, tokenString(item.key))
+        end
+    end
+    return table.concat(parts, " ")
+end
+
+local function getInitialSlotBoldSet(settings, slot)
+    local bold_set = getSlotBoldSet(settings, slot)
+    if bold_set ~= nil then
+        return bold_set
+    end
+    bold_set = {}
+    if getDefaultBold(settings) then
+        for _, key in ipairs(getTemplateTokens(settings[templateKeyForSlot(slot)])) do
+            bold_set[key] = true
+        end
+    end
+    return bold_set
+end
+
+local function getSlotBoldMenu(plugin, slot)
+    local items = {}
+    for _, token in ipairs(TEMPLATE_TOKENS) do
+        table.insert(items, {
+            text_func = function()
+                if templateToTokenSet(getSettings()[templateKeyForSlot(slot)])[token.key] then
+                    return token.text
+                end
+                return T(_("%1 (not shown)"), token.text)
+            end,
+            checked_func = function()
+                local settings = getSettings()
+                if not templateToTokenSet(settings[templateKeyForSlot(slot)])[token.key] then
+                    return false
+                end
+                return isSlotTokenBold(settings, slot, token.key, getDefaultBold(settings))
+            end,
+            callback = function(touchmenu_instance)
+                local settings = getSettings()
+                local slot_template = settings[templateKeyForSlot(slot)]
+                if not templateToTokenSet(slot_template)[token.key] then
+                    return
+                end
+                local bold_set = getInitialSlotBoldSet(settings, slot)
+                bold_set[token.key] = not bold_set[token.key]
+                plugin:saveAndRefresh(boldKeyForSlot(slot), tokenSetToTemplate(bold_set, slot_template), touchmenu_instance)
+            end,
+        })
+    end
+    return items
+end
+
+local function getSeparatorMenu(plugin)
+    local items = {}
+    for _, separator in ipairs(SEPARATORS) do
+        table.insert(items, {
+            text = separator.text,
+            checked_func = function()
+                return getSettings().separator == separator.value
+            end,
+            callback = function(touchmenu_instance)
+                plugin:saveAndRefresh("separator", separator.value, touchmenu_instance)
+            end,
+        })
+    end
+    return items
+end
+
+local function getFontSizeMenu(plugin)
+    local items = {}
+    for _, size in ipairs(FONT_SIZES) do
+        table.insert(items, {
+            text = tostring(size),
+            checked_func = function()
+                return (getSettings().font_size or getFooterSettings().text_font_size or 14) == size
+            end,
+            callback = function(touchmenu_instance)
+                plugin:saveAndRefresh("font_size", size, touchmenu_instance)
+            end,
+        })
+    end
+    return items
+end
+
 function ReaderHeader:init()
     installPaintPatch()
     installStatusBarMenuPatch(self)
@@ -347,78 +731,50 @@ function ReaderHeader:onReaderReady()
     end
 end
 
-function ReaderHeader:showTokens()
-    UIManager:show(InfoMessage:new{
-        text = _([[Template tokens:
-{title}, {author}, {chapter}, {page}, {pages}, {page_progress}, {percentage}, {chapter_progress}, {pages_left}, {pages_left_book}, {time}, {battery}, {separator}]]),
-        timeout = 12,
-    })
-end
-
-function ReaderHeader:editTextSetting(title, key)
+function ReaderHeader:configureSlotItems(title, slot, touchmenu_instance)
+    local key = templateKeyForSlot(slot)
     local settings = getSettings()
-    local input_dialog
-    input_dialog = InputDialog:new{
+    local item_table = templateToTokenItems(settings[key])
+    local preview = startPreviewSettings(settings)
+    local preview_callback = function()
+        preview[key] = tokenItemsToTemplate(item_table)
+        refreshReader()
+    end
+    for _, item in ipairs(item_table) do
+        item.preview_callback = preview_callback
+    end
+    local SortWidget = require("ui/widget/sortwidget")
+    local sort_widget
+    sort_widget = SortWidget:new{
         title = title,
-        input = tostring(settings[key] or ""),
-        buttons = {
-            {
-                {
-                    text = _("Cancel"),
-                    callback = function()
-                        UIManager:close(input_dialog)
-                    end,
-                },
-                {
-                    text = _("Save"),
-                    is_enter_default = true,
-                    callback = function()
-                        saveSetting(key, input_dialog:getInputText())
-                        UIManager:close(input_dialog)
-                        refreshReader()
-                    end,
-                },
-            },
-        },
+        item_table = item_table,
+        callback = function()
+            local template = tokenItemsToTemplate(item_table)
+            preview[key] = template
+            saveSetting(key, template)
+            refreshReader()
+            if touchmenu_instance then touchmenu_instance:updateItems() end
+        end,
     }
-    UIManager:show(input_dialog)
-    input_dialog:onShowKeyboard()
-end
-
-function ReaderHeader:editNumberSetting(title, key, min_value, max_value)
-    local settings = getSettings()
-    local input_dialog
-    input_dialog = InputDialog:new{
-        title = title,
-        input = tostring(settings[key] or DEFAULT_SETTINGS[key] or ""),
-        input_type = "number",
-        buttons = {
-            {
-                {
-                    text = _("Cancel"),
-                    callback = function()
-                        UIManager:close(input_dialog)
-                    end,
-                },
-                {
-                    text = _("Save"),
-                    is_enter_default = true,
-                    callback = function()
-                        local value = tonumber(input_dialog:getInputText())
-                        if value then
-                            if min_value and value < min_value then value = min_value end
-                            if max_value and value > max_value then value = max_value end
-                            saveSetting(key, value)
-                            refreshReader()
-                        end
-                        UIManager:close(input_dialog)
-                    end,
-                },
-            },
-        },
-    }
-    UIManager:show(input_dialog)
-    input_dialog:onShowKeyboard()
+    local original_moveItem = sort_widget.moveItem
+    sort_widget.moveItem = function(widget, diff)
+        local result = original_moveItem(widget, diff)
+        preview_callback()
+        return result
+    end
+    local original_onCancel = sort_widget.onCancel
+    sort_widget.onCancel = function(widget)
+        local result = original_onCancel(widget)
+        preview_callback()
+        return result
+    end
+    local original_onClose = sort_widget.onClose
+    sort_widget.onClose = function(widget)
+        stopPreviewSettings()
+        refreshReader()
+        return original_onClose(widget)
+    end
+    UIManager:show(sort_widget)
 end
 
 function ReaderHeader:resetSettings()
@@ -434,6 +790,12 @@ function ReaderHeader:resetSettings()
     UIManager:show(confirm_box)
 end
 
+function ReaderHeader:saveAndRefresh(key, value, touchmenu_instance)
+    saveSetting(key, value)
+    refreshReader()
+    if touchmenu_instance then touchmenu_instance:updateItems() end
+end
+
 function ReaderHeader:getHeaderMenuTable()
     return {
         reader_header_settings = true,
@@ -444,92 +806,81 @@ function ReaderHeader:getHeaderMenuTable()
                 checked_func = function()
                     return getSettings().enabled
                 end,
-                callback = function()
-                    saveSetting("enabled", not getSettings().enabled)
-                    refreshReader()
+                callback = function(touchmenu_instance)
+                    self:saveAndRefresh("enabled", not getSettings().enabled, touchmenu_instance)
                 end,
             },
             {
-                text = _("Layout"),
-                sub_item_table = {
-                    {
-                        text = _("Centered"),
-                        checked_func = function()
-                            return getSettings().layout == "centered"
-                        end,
-                        callback = function()
-                            saveSetting("layout", "centered")
-                            refreshReader()
-                        end,
-                    },
-                    {
-                        text = _("Cornered"),
-                        checked_func = function()
-                            return getSettings().layout == "cornered"
-                        end,
-                        callback = function()
-                            saveSetting("layout", "cornered")
-                            refreshReader()
-                        end,
-                    },
-                },
-            },
-            {
-                text = _("Center text"),
-                callback = function()
-                    self:editTextSetting(_("Center text"), "center_template")
+                text = _("Center items"),
+                help_text = _("Tap a checkmark to show or hide an item. Tap an item row to select it, then use the move buttons to change its order."),
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    self:configureSlotItems(_("Center items"), "center", touchmenu_instance)
                 end,
             },
             {
-                text = _("Left text"),
-                callback = function()
-                    self:editTextSetting(_("Left text"), "left_template")
+                text = _("Center bold items"),
+                help_text = _("Toggle bold for each selected center item."),
+                sub_item_table = getSlotBoldMenu(self, "center"),
+            },
+            {
+                text = _("Left items"),
+                help_text = _("Tap a checkmark to show or hide an item. Tap an item row to select it, then use the move buttons to change its order."),
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    self:configureSlotItems(_("Left items"), "left", touchmenu_instance)
                 end,
             },
             {
-                text = _("Right text"),
-                callback = function()
-                    self:editTextSetting(_("Right text"), "right_template")
+                text = _("Left bold items"),
+                help_text = _("Toggle bold for each selected left item."),
+                sub_item_table = getSlotBoldMenu(self, "left"),
+            },
+            {
+                text = _("Right items"),
+                help_text = _("Tap a checkmark to show or hide an item. Tap an item row to select it, then use the move buttons to change its order."),
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    self:configureSlotItems(_("Right items"), "right", touchmenu_instance)
                 end,
             },
             {
-                text = _("Separator"),
-                callback = function()
-                    self:editTextSetting(_("Separator"), "separator")
-                end,
+                text = _("Right bold items"),
+                help_text = _("Toggle bold for each selected right item."),
+                sub_item_table = getSlotBoldMenu(self, "right"),
             },
             {
-                text = _("Font size"),
-                callback = function()
-                    self:editNumberSetting(_("Font size"), "font_size", 6, 72)
+                text_func = function()
+                    local separator = getSettings().separator
+                    if separator == "" then separator = _("None") end
+                    return T(_("Separator: %1"), separator)
                 end,
+                sub_item_table = getSeparatorMenu(self),
             },
             {
-                text = _("Bold"),
+                text_func = function()
+                    local settings = getSettings()
+                    return T(_("Font size: %1"), settings.font_size or getFooterSettings().text_font_size or 14)
+                end,
+                sub_item_table = getFontSizeMenu(self),
+            },
+            {
+                text = _("Bold by default"),
                 checked_func = function()
-                    local settings = getSettings()
-                    if settings.font_bold == nil then
-                        return getFooterSettings().text_font_bold or false
-                    end
-                    return settings.font_bold
+                    return getDefaultBold(getSettings())
                 end,
-                callback = function()
+                callback = function(touchmenu_instance)
                     local settings = getSettings()
-                    local current = settings.font_bold
-                    if current == nil then
-                        current = getFooterSettings().text_font_bold or false
-                    end
-                    saveSetting("font_bold", not current)
-                    refreshReader()
+                    self:saveAndRefresh("font_bold", not getDefaultBold(settings), touchmenu_instance)
                 end,
             },
             {
                 text = _("Top padding"),
                 sub_item_table = {
-                    { text = _("Tiny"), checked_func = function() return getSettings().top_padding == "tiny" end, callback = function() saveSetting("top_padding", "tiny"); refreshReader() end },
-                    { text = _("Small"), checked_func = function() return getSettings().top_padding == "small" end, callback = function() saveSetting("top_padding", "small"); refreshReader() end },
-                    { text = _("Default"), checked_func = function() return getSettings().top_padding == "default" end, callback = function() saveSetting("top_padding", "default"); refreshReader() end },
-                    { text = _("Large"), checked_func = function() return getSettings().top_padding == "large" end, callback = function() saveSetting("top_padding", "large"); refreshReader() end },
+                    { text = _("Tiny"), checked_func = function() return getSettings().top_padding == "tiny" end, callback = function(touchmenu_instance) self:saveAndRefresh("top_padding", "tiny", touchmenu_instance) end },
+                    { text = _("Small"), checked_func = function() return getSettings().top_padding == "small" end, callback = function(touchmenu_instance) self:saveAndRefresh("top_padding", "small", touchmenu_instance) end },
+                    { text = _("Default"), checked_func = function() return getSettings().top_padding == "default" end, callback = function(touchmenu_instance) self:saveAndRefresh("top_padding", "default", touchmenu_instance) end },
+                    { text = _("Large"), checked_func = function() return getSettings().top_padding == "large" end, callback = function(touchmenu_instance) self:saveAndRefresh("top_padding", "large", touchmenu_instance) end },
                 },
             },
             {
@@ -537,43 +888,18 @@ function ReaderHeader:getHeaderMenuTable()
                 checked_func = function()
                     return getSettings().use_book_margins
                 end,
-                callback = function()
-                    saveSetting("use_book_margins", not getSettings().use_book_margins)
-                    refreshReader()
+                callback = function(touchmenu_instance)
+                    self:saveAndRefresh("use_book_margins", not getSettings().use_book_margins, touchmenu_instance)
                 end,
             },
             {
                 text = _("Fixed margin"),
                 sub_item_table = {
-                    { text = _("Tiny"), checked_func = function() return getSettings().margin == "tiny" end, callback = function() saveSetting("margin", "tiny"); refreshReader() end },
-                    { text = _("Small"), checked_func = function() return getSettings().margin == "small" end, callback = function() saveSetting("margin", "small"); refreshReader() end },
-                    { text = _("Default"), checked_func = function() return getSettings().margin == "default" end, callback = function() saveSetting("margin", "default"); refreshReader() end },
-                    { text = _("Large"), checked_func = function() return getSettings().margin == "large" end, callback = function() saveSetting("margin", "large"); refreshReader() end },
+                    { text = _("Tiny"), checked_func = function() return getSettings().margin == "tiny" end, callback = function(touchmenu_instance) self:saveAndRefresh("margin", "tiny", touchmenu_instance) end },
+                    { text = _("Small"), checked_func = function() return getSettings().margin == "small" end, callback = function(touchmenu_instance) self:saveAndRefresh("margin", "small", touchmenu_instance) end },
+                    { text = _("Default"), checked_func = function() return getSettings().margin == "default" end, callback = function(touchmenu_instance) self:saveAndRefresh("margin", "default", touchmenu_instance) end },
+                    { text = _("Large"), checked_func = function() return getSettings().margin == "large" end, callback = function(touchmenu_instance) self:saveAndRefresh("margin", "large", touchmenu_instance) end },
                 },
-            },
-            {
-                text = _("Center max width percent"),
-                callback = function()
-                    self:editNumberSetting(_("Center max width percent"), "max_width_pct", 10, 100)
-                end,
-            },
-            {
-                text = _("Left max width percent"),
-                callback = function()
-                    self:editNumberSetting(_("Left max width percent"), "left_max_width_pct", 10, 100)
-                end,
-            },
-            {
-                text = _("Right max width percent"),
-                callback = function()
-                    self:editNumberSetting(_("Right max width percent"), "right_max_width_pct", 10, 100)
-                end,
-            },
-            {
-                text = _("Available tokens"),
-                callback = function()
-                    self:showTokens()
-                end,
             },
             {
                 text = _("Reset defaults"),
