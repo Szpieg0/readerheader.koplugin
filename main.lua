@@ -23,6 +23,11 @@ local logger = require("logger")
 local util = require("util")
 local _ = require("gettext")
 local T = require("ffi/util").template
+local NetworkMgr
+local ok_network_mgr, network_mgr = pcall(require, "ui/network/manager")
+if ok_network_mgr then
+    NetworkMgr = network_mgr
+end
 
 local Screen = Device.screen
 local unpack = unpack or table.unpack
@@ -32,6 +37,7 @@ local boldKeyForSlot
 local templateToTokenSet
 local getTemplateTokens
 local tokenSetToTemplate
+local faceKeyForToken
 local ReaderHeader = WidgetContainer:extend{
     name = "readerheader",
     is_doc_only = true,
@@ -50,6 +56,7 @@ local DEFAULT_SETTINGS = {
     use_book_margins = true,
     margin = "large",
     max_width_pct = 100,
+    hide_wifi_disconnected = false,
 }
 
 local original_paintTo = ReaderView.paintTo
@@ -69,6 +76,7 @@ local TEMPLATE_TOKENS = {
     { key = "pages_left", text = _("Pages left in chapter") },
     { key = "pages_left_book", text = _("Pages left in book") },
     { key = "time", text = _("Time") },
+    { key = "wifi", text = _("Wi-Fi") },
     { key = "battery", text = _("Battery") },
     { key = "separator", text = _("Separator") },
 }
@@ -83,6 +91,8 @@ local SEPARATORS = {
 }
 
 local FONT_SIZES = { 8, 10, 12, 14, 16, 18, 20, 22, 24, 28, 32 }
+local WIFI_ICON = "\u{ECA8}"
+local WIFI_OFF_ICON = "\u{ECA9}"
 
 local function copyDefaults()
     local settings = {}
@@ -167,6 +177,30 @@ local function formatAuthor(authors)
     return authors
 end
 
+local function getWifiStatus(settings)
+    if not NetworkMgr then
+        return ""
+    end
+    local ok, is_wifi_on = pcall(function()
+        if NetworkMgr.isWifiOn then
+            return NetworkMgr:isWifiOn()
+        elseif NetworkMgr.isOnline then
+            return NetworkMgr:isOnline()
+        end
+        return nil
+    end)
+    if not ok or is_wifi_on == nil then
+        return ""
+    end
+    if is_wifi_on then
+        return WIFI_ICON
+    end
+    if settings.hide_wifi_disconnected then
+        return ""
+    end
+    return WIFI_OFF_ICON
+end
+
 local function collectValues(view, settings)
     local book_title = ""
     local book_author = ""
@@ -213,6 +247,7 @@ local function collectValues(view, settings)
         pages_left = tostring(pages_left),
         pages_left_book = tostring(pages_left_book),
         time = datetime.secondsToHour(os.time(), G_reader_settings:isTrue("twelve_hour_clock")) or "",
+        wifi = getWifiStatus(settings),
         battery = battery,
         separator = settings.separator or "-",
     }
@@ -279,16 +314,18 @@ local function getSlotSegments(template, values, settings, slot, default_bold)
             table.insert(segments, {
                 text = text,
                 bold = isSlotTokenBold(settings, slot, key, default_bold),
+                face_key = faceKeyForToken(key),
             })
         end
     end
     return segments
 end
 
-local function measureSegments(segments, face)
+local function measureSegments(segments, face, font_size)
     local width = 0
     for _, segment in ipairs(segments) do
-        segment.width = measureText(segment.text, face, segment.bold)
+        local segment_face = segment.face_key and Font:getFace(segment.face_key, font_size) or face
+        segment.width = measureText(segment.text, segment_face, segment.bold)
         width = width + segment.width
     end
     return width
@@ -301,17 +338,18 @@ local function copySegments(segments)
             text = segment.text,
             bold = segment.bold,
             width = segment.width,
+            face_key = segment.face_key,
         })
     end
     return copied
 end
 
-local function fitSegments(segments, face, max_width)
+local function fitSegments(segments, face, font_size, max_width)
     if max_width <= 0 then
         return {}
     end
     local fitted = copySegments(segments)
-    local width = measureSegments(fitted, face)
+    local width = measureSegments(fitted, face, font_size)
     local loops = 0
     while width > max_width and loops < (#fitted * 3) do
         loops = loops + 1
@@ -325,15 +363,16 @@ local function fitSegments(segments, face, max_width)
         end
         if not widest_index then break end
         local segment = fitted[widest_index]
-        local target_width = math.max(0, segment.width - (width - max_width) - measureText("...", face, segment.bold))
+        local segment_face = segment.face_key and Font:getFace(segment.face_key, font_size) or face
+        local target_width = math.max(0, segment.width - (width - max_width) - measureText("...", segment_face, segment.bold))
         if target_width <= 0 then
             segment.text = ""
             segment.width = 0
         else
-            segment.text = fitText(segment.text, face, segment.bold, target_width)
-            segment.width = measureText(segment.text, face, segment.bold)
+            segment.text = fitText(segment.text, segment_face, segment.bold, target_width)
+            segment.width = measureText(segment.text, segment_face, segment.bold)
         end
-        width = measureSegments(fitted, face)
+        width = measureSegments(fitted, face, font_size)
     end
     while width > max_width do
         local widest_index
@@ -347,7 +386,7 @@ local function fitSegments(segments, face, max_width)
         if not widest_index then break end
         fitted[widest_index].text = ""
         fitted[widest_index].width = 0
-        width = measureSegments(fitted, face)
+        width = measureSegments(fitted, face, font_size)
     end
     return fitted
 end
@@ -376,11 +415,12 @@ local function newHeaderTextWidget(text, face, bold, fgcolor)
     }
 end
 
-local function newHeaderSlotWidget(segments, face, fgcolor, max_width)
+local function newHeaderSlotWidget(segments, face, font_size, fgcolor, max_width)
     local widgets = {}
-    for _, segment in ipairs(fitSegments(segments, face, max_width)) do
+    for _, segment in ipairs(fitSegments(segments, face, font_size, max_width)) do
         if segment.text ~= "" then
-            table.insert(widgets, newHeaderTextWidget(segment.text, face, segment.bold, fgcolor))
+            local segment_face = segment.face_key and Font:getFace(segment.face_key, font_size) or face
+            table.insert(widgets, newHeaderTextWidget(segment.text, segment_face, segment.bold, fgcolor))
         end
     end
     if #widgets == 0 then
@@ -389,7 +429,7 @@ local function newHeaderSlotWidget(segments, face, fgcolor, max_width)
     return HorizontalGroup:new(widgets)
 end
 
-local function paintSlotHeader(view, bb, x, y, settings, face, default_bold, fgcolor, top_padding, values)
+local function paintSlotHeader(view, bb, x, y, settings, face, font_size, default_bold, fgcolor, top_padding, values)
     local avail_width, left_margin, right_margin = getContentWidth(view, settings)
     if avail_width <= 0 then
         return
@@ -397,9 +437,9 @@ local function paintSlotHeader(view, bb, x, y, settings, face, default_bold, fgc
     local left_segments = getSlotSegments(settings.left_template, values, settings, "left", default_bold)
     local center_segments = getSlotSegments(settings.center_template, values, settings, "center", default_bold)
     local right_segments = getSlotSegments(settings.right_template, values, settings, "right", default_bold)
-    local left_width = measureSegments(left_segments, face)
-    local center_width = measureSegments(center_segments, face)
-    local right_width = measureSegments(right_segments, face)
+    local left_width = measureSegments(left_segments, face, font_size)
+    local center_width = measureSegments(center_segments, face, font_size)
+    local right_width = measureSegments(right_segments, face, font_size)
     local has_left = left_width > 0
     local has_center = center_width > 0
     local has_right = right_width > 0
@@ -424,9 +464,9 @@ local function paintSlotHeader(view, bb, x, y, settings, face, default_bold, fgc
         end
     end
 
-    local left_widget = has_left and left_max_width > 0 and newHeaderSlotWidget(left_segments, face, fgcolor, left_max_width) or nil
-    local center_widget = has_center and center_max_width > 0 and newHeaderSlotWidget(center_segments, face, fgcolor, center_max_width) or nil
-    local right_widget = has_right and right_max_width > 0 and newHeaderSlotWidget(right_segments, face, fgcolor, right_max_width) or nil
+    local left_widget = has_left and left_max_width > 0 and newHeaderSlotWidget(left_segments, face, font_size, fgcolor, left_max_width) or nil
+    local center_widget = has_center and center_max_width > 0 and newHeaderSlotWidget(center_segments, face, font_size, fgcolor, center_max_width) or nil
+    local right_widget = has_right and right_max_width > 0 and newHeaderSlotWidget(right_segments, face, font_size, fgcolor, right_max_width) or nil
     if not left_widget and not center_widget and not right_widget then
         return
     end
@@ -478,7 +518,7 @@ local function paintHeader(view, bb, x, y)
     local top_padding = getPadding(settings.top_padding)
     local values = collectValues(view, settings)
 
-    paintSlotHeader(view, bb, x, y, settings, face, bold, fgcolor, top_padding, values)
+    paintSlotHeader(view, bb, x, y, settings, face, font_size, bold, fgcolor, top_padding, values)
 end
 
 local function installPaintPatch()
@@ -591,6 +631,12 @@ tokenSetToTemplate = function(set, order_template)
         end
     end
     return table.concat(parts, " ")
+end
+
+faceKeyForToken = function(token_key)
+    if token_key == "wifi" then
+        return "infofont"
+    end
 end
 
 local function updateTokenItemText(item)
@@ -850,6 +896,15 @@ function ReaderHeader:getHeaderMenuTable()
                 callback = function(touchmenu_instance)
                     local settings = getSettings()
                     self:saveAndRefresh("font_bold", not getDefaultBold(settings), touchmenu_instance)
+                end,
+            },
+            {
+                text = _("Hide Wi-Fi when disconnected"),
+                checked_func = function()
+                    return getSettings().hide_wifi_disconnected
+                end,
+                callback = function(touchmenu_instance)
+                    self:saveAndRefresh("hide_wifi_disconnected", not getSettings().hide_wifi_disconnected, touchmenu_instance)
                 end,
             },
             {
