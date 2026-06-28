@@ -1,5 +1,6 @@
 local BD = require("ui/bidi")
 local Blitbuffer = require("ffi/blitbuffer")
+local ButtonDialog = require("ui/widget/buttondialog")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local ConfirmBox = require("ui/widget/confirmbox")
 local Device = require("device")
@@ -574,7 +575,65 @@ tokenSetToTemplate = function(set, order_template)
     return table.concat(parts, " ")
 end
 
-local function templateToTokenItems(template)
+local function updateTokenItemText(item)
+    item.text = item.label
+    if item.bold_set and item.bold_set[item.key] then
+        item.text = T(_("%1 (bold)"), item.text)
+    end
+    item.text = item.text .. " ▶"
+end
+
+local function showBoldDialog(item, refresh_callback)
+    local dialog
+    local bold_text = item.bold_set[item.key] and _("Regular") or _("Bold")
+    dialog = ButtonDialog:new{
+        title = item.label,
+        buttons = {
+            {{
+                text = bold_text,
+                callback = function()
+                    item.bold_set[item.key] = not item.bold_set[item.key]
+                    updateTokenItemText(item)
+                    if item.preview_callback then item.preview_callback() end
+                    if refresh_callback then refresh_callback() end
+                    UIManager:close(dialog)
+                end,
+            }},
+            {{
+                text = _("Close"),
+                callback = function()
+                    UIManager:close(dialog)
+                end,
+            }},
+        },
+    }
+    UIManager:show(dialog)
+end
+
+local function newTokenItem(token, checked, bold_set)
+    local entry = {
+        label = token.text,
+        key = token.key,
+        checked = checked,
+        dim = not checked,
+        bold_set = bold_set,
+    }
+    updateTokenItemText(entry)
+    entry.checked_func = function()
+        return entry.checked
+    end
+    entry.callback = function(item)
+        item.checked = not item.checked
+        item.dim = not item.checked
+        if item.preview_callback then item.preview_callback() end
+    end
+    entry.hold_callback = function(item, refresh_callback)
+        showBoldDialog(item, refresh_callback)
+    end
+    return entry
+end
+
+local function templateToTokenItems(template, bold_set)
     local used = {}
     local items = {}
     local known = {}
@@ -585,19 +644,7 @@ local function templateToTokenItems(template)
 
     for key in tostring(template or ""):gmatch("{([%w_]+)}") do
         if known[key] and not used[key] then
-            local entry = {}
-            entry.text = known[key].text
-            entry.key = key
-            entry.checked = true
-            entry.checked_func = function()
-                return entry.checked
-            end
-            entry.callback = function(item)
-                item.checked = not item.checked
-                item.dim = not item.checked
-                if item.preview_callback then item.preview_callback() end
-            end
-            table.insert(items, entry)
+            table.insert(items, newTokenItem(known[key], true, bold_set))
             used[key] = true
         end
     end
@@ -605,20 +652,7 @@ local function templateToTokenItems(template)
     local selected = templateToTokenSet(template)
     for _, token in ipairs(TEMPLATE_TOKENS) do
         if not used[token.key] then
-            local entry = {}
-            entry.text = token.text
-            entry.key = token.key
-            entry.checked = selected[token.key] == true
-            entry.dim = selected[token.key] ~= true
-            entry.checked_func = function()
-                return entry.checked
-            end
-            entry.callback = function(item)
-                item.checked = not item.checked
-                item.dim = not item.checked
-                if item.preview_callback then item.preview_callback() end
-            end
-            table.insert(items, entry)
+            table.insert(items, newTokenItem(token, selected[token.key] == true, bold_set))
         end
     end
 
@@ -647,38 +681,6 @@ local function getInitialSlotBoldSet(settings, slot)
         end
     end
     return bold_set
-end
-
-local function getSlotBoldMenu(plugin, slot)
-    local items = {}
-    for _, token in ipairs(TEMPLATE_TOKENS) do
-        table.insert(items, {
-            text_func = function()
-                if templateToTokenSet(getSettings()[templateKeyForSlot(slot)])[token.key] then
-                    return token.text
-                end
-                return T(_("%1 (not shown)"), token.text)
-            end,
-            checked_func = function()
-                local settings = getSettings()
-                if not templateToTokenSet(settings[templateKeyForSlot(slot)])[token.key] then
-                    return false
-                end
-                return isSlotTokenBold(settings, slot, token.key, getDefaultBold(settings))
-            end,
-            callback = function(touchmenu_instance)
-                local settings = getSettings()
-                local slot_template = settings[templateKeyForSlot(slot)]
-                if not templateToTokenSet(slot_template)[token.key] then
-                    return
-                end
-                local bold_set = getInitialSlotBoldSet(settings, slot)
-                bold_set[token.key] = not bold_set[token.key]
-                plugin:saveAndRefresh(boldKeyForSlot(slot), tokenSetToTemplate(bold_set, slot_template), touchmenu_instance)
-            end,
-        })
-    end
-    return items
 end
 
 local function getSeparatorMenu(plugin)
@@ -733,11 +735,14 @@ end
 
 function ReaderHeader:configureSlotItems(title, slot, touchmenu_instance)
     local key = templateKeyForSlot(slot)
+    local bold_key = boldKeyForSlot(slot)
     local settings = getSettings()
-    local item_table = templateToTokenItems(settings[key])
+    local bold_set = getInitialSlotBoldSet(settings, slot)
+    local item_table = templateToTokenItems(settings[key], bold_set)
     local preview = startPreviewSettings(settings)
     local preview_callback = function()
         preview[key] = tokenItemsToTemplate(item_table)
+        preview[bold_key] = tokenSetToTemplate(bold_set, preview[key])
         refreshReader()
     end
     for _, item in ipairs(item_table) do
@@ -751,7 +756,9 @@ function ReaderHeader:configureSlotItems(title, slot, touchmenu_instance)
         callback = function()
             local template = tokenItemsToTemplate(item_table)
             preview[key] = template
+            preview[bold_key] = tokenSetToTemplate(bold_set, template)
             saveSetting(key, template)
+            saveSetting(bold_key, preview[bold_key])
             refreshReader()
             if touchmenu_instance then touchmenu_instance:updateItems() end
         end,
@@ -812,42 +819,27 @@ function ReaderHeader:getHeaderMenuTable()
             },
             {
                 text = _("Center items"),
-                help_text = _("Tap a checkmark to show or hide an item. Tap an item row to select it, then use the move buttons to change its order."),
+                help_text = _("Tap a checkmark to show or hide an item. Tap an item row to select it, then use the move buttons to change its order. Long-press an item to toggle bold."),
                 keep_menu_open = true,
                 callback = function(touchmenu_instance)
                     self:configureSlotItems(_("Center items"), "center", touchmenu_instance)
                 end,
             },
             {
-                text = _("Center bold items"),
-                help_text = _("Toggle bold for each selected center item."),
-                sub_item_table = getSlotBoldMenu(self, "center"),
-            },
-            {
                 text = _("Left items"),
-                help_text = _("Tap a checkmark to show or hide an item. Tap an item row to select it, then use the move buttons to change its order."),
+                help_text = _("Tap a checkmark to show or hide an item. Tap an item row to select it, then use the move buttons to change its order. Long-press an item to toggle bold."),
                 keep_menu_open = true,
                 callback = function(touchmenu_instance)
                     self:configureSlotItems(_("Left items"), "left", touchmenu_instance)
                 end,
             },
             {
-                text = _("Left bold items"),
-                help_text = _("Toggle bold for each selected left item."),
-                sub_item_table = getSlotBoldMenu(self, "left"),
-            },
-            {
                 text = _("Right items"),
-                help_text = _("Tap a checkmark to show or hide an item. Tap an item row to select it, then use the move buttons to change its order."),
+                help_text = _("Tap a checkmark to show or hide an item. Tap an item row to select it, then use the move buttons to change its order. Long-press an item to toggle bold."),
                 keep_menu_open = true,
                 callback = function(touchmenu_instance)
                     self:configureSlotItems(_("Right items"), "right", touchmenu_instance)
                 end,
-            },
-            {
-                text = _("Right bold items"),
-                help_text = _("Toggle bold for each selected right item."),
-                sub_item_table = getSlotBoldMenu(self, "right"),
             },
             {
                 text_func = function()
